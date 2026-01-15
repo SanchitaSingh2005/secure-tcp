@@ -1,55 +1,61 @@
 import socket
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.fernet import Fernet
+from threading import Thread
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
+import os
 
-# Generate RSA keys
-private_key = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048
-)
-public_key = private_key.public_key()
+HOST = '127.0.0.1'
+PORT = 12345
 
-public_pem = public_key.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
-)
+key = RSA.generate(2048)
+private_key = key
+public_key = key.publickey()
 
-HOST = "127.0.0.1"
-PORT = 6000
+def handle_client(conn, addr):
+    print(f"[NEW CONNECTION] {addr} connected.")
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen(1)
+    # Send RSA public key
+    conn.send(public_key.export_key())
 
-print("Server listening...")
-conn, addr = server.accept()
-print("Connected:", addr)
+    # Receive AES session key
+    encrypted_session_key = conn.recv(256)
+    cipher_rsa = PKCS1_OAEP.new(private_key)
+    session_key = cipher_rsa.decrypt(encrypted_session_key)
 
-# Send public key
-conn.send(public_pem)
+    while True:
+        try:
+            # Receive command first (text or file)
+            command = conn.recv(1024)
+            if not command:
+                break
+            command = AES.new(session_key, AES.MODE_EAX, nonce=command[:16]).decrypt_and_verify(command[16:], command[16:32])
+            command = command.decode()
 
-# Receive encrypted AES key
-encrypted_aes = conn.recv(256)
-aes_key = private_key.decrypt(
-    encrypted_aes,
-    padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-        algorithm=hashes.SHA256(),
-        label=None
-    )
-)
+            if command.startswith("SEND "):
+                filename = command.split(" ")[1]
+                # Receive file size
+                filesize = int(conn.recv(16).decode())
+                with open(f"received_{filename}", "wb") as f:
+                    remaining = filesize
+                    while remaining:
+                        chunk = conn.recv(min(1024, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                print(f"[{addr}] File received: {filename}")
+            else:
+                # normal text message
+                nonce = conn.recv(16)
+                tag = conn.recv(16)
+                ciphertext = conn.recv(1024)
+                if not ciphertext:
+                    break
+                data = AES.new(session_key, AES.MODE_EAX, nonce=nonce).decrypt_and_verify(ciphertext, tag)
+                print(f"[{addr}] {data.decode()}")
+        except Exception as e:
+            print(f"[{addr}] disconnected.")
+            break
 
-cipher = Fernet(aes_key)
-
-# Receive encrypted message
-encrypted_msg = conn.recv(1024)
-msg = cipher.decrypt(encrypted_msg)
-
-print("Client says:", msg.decode())
-
-reply = cipher.encrypt(b"Secure message received")
-conn.send(reply)
-
-conn.close()
-server.close()
+    conn.close()
